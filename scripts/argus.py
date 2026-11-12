@@ -200,6 +200,10 @@ UNAUTH_BODY = rx(r"(?i)\b(unauthori[sz]ed|unauthenticated|not\s+authenticated|au
                  r"please\s+log\s*in|missing\s+(?:auth\w*|token)|invalid\s+(?:or\s+expired\s+)?(?:token|session|credentials)|"
                  r"token\s+(?:is\s+)?(?:required|missing|expired)|jwt\s+(?:expired|malformed|must\s+be\s+provided)|"
                  r"access\s+denied|forbidden)\b")
+SESSION_NAME = rx(r"(?i)(sess|\bsid\b|auth|token|jwt|login|remember|sso)")
+TOKEN_HEADERS = {"authorization", "x-auth-token", "x-access-token", "x-refresh-token", "refresh-token", "x-api-key",
+                 "x-session-id", "x-jwt", "token", "x-csrf-token", "x-xsrf-token"}
+DISCLOSURE_HEADERS = ("x-powered-by", "x-aspnet-version", "x-aspnetmvc-version", "x-generator")
 PASSWORD_FORM = rx(r"""(?i)<input[^>]+type\s*=\s*['"]?password""")
 REDIRECTS = (301, 302, 303, 307, 308)
 
@@ -234,6 +238,7 @@ class Endpoint:
     templated: bool = False
     skipped: str = ""
     depth: int = 0
+    headers: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -375,6 +380,20 @@ def kind_of(ctype: str, url: str) -> str:
     return "other"
 
 
+def jwt_note(tok: str) -> tuple[str, str]:
+    try:
+        dec = lambda p: json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
+        h, p = (dec(x) for x in tok.split(".")[:2])
+        bits = [f"alg={h.get('alg')}", "claims=" + ",".join(list(p)[:8])]
+        if isinstance(p.get("exp"), (int, float)):
+            bits.append("expires " + datetime.fromtimestamp(p["exp"], timezone.utc).strftime("%Y-%m-%d"))
+        elif "exp" not in p:
+            bits.append("no exp claim")
+        return "; ".join(bits), str(h.get("alg", "")).lower()
+    except Exception:
+        return "", ""
+
+
 def similar(a: str, b: str) -> bool:
     n = lambda t: re.sub(r"[0-9a-fA-F]{16,}|\d+", "#", t)
     na, nb = n(a), n(b)
@@ -478,6 +497,9 @@ class Analyzer:
                         if not j:
                             continue
                         s2, note, val = j
+                    elif rid == "jwt":
+                        note, alg = jwt_note(val)
+                        s2 = "high" if alg == "none" else sev
                     elif rid == "email":
                         tld = val.rsplit(".", 1)[-1].lower()
                         if not tld.isalpha() or tld in {"png", "jpg", "jpeg", "gif", "svg", "webp", "js", "css", "json", "map", "ico"}:
@@ -598,6 +620,9 @@ class Argus:
         self.endpoints: dict[str, Endpoint] = {}
         self.findings: dict[tuple, Finding] = {}
         self.forms, self.errors = [], []
+        self.cookies: dict[tuple, dict] = {}
+        self.tokens: list[dict] = []
+        self.hdr_hosts: set[str] = set()
         self.external = defaultdict(int)
         self.queued, self.gated = set(), set()
         self.queue: list[tuple] = []
@@ -648,6 +673,10 @@ class Argus:
                           allow_redirects=False, stream=True)
             except requests.RequestException as e:
                 return Resp(cur, error=type(e).__name__ + ": " + str(e)[:120], chain=chain)
+            hdrs = dict(r.headers)
+            rh = getattr(r.raw, "headers", None)
+            cookies = rh.getlist("Set-Cookie") if hasattr(rh, "getlist") else ([hdrs["Set-Cookie"]] if "Set-Cookie" in hdrs else [])
+            self.mine_headers(cur, hdrs, cookies)
             if r.status_code in REDIRECTS and r.headers.get("Location"):
                 nxt = urljoin(cur, r.headers["Location"])
                 chain.append((r.status_code, nxt))
@@ -674,6 +703,96 @@ class Argus:
                     text = body.decode(r.encoding or "latin-1", "replace")
             return Resp(cur, r.status_code, dict(r.headers), text, ctype, len(body), chain)
         return Resp(cur, status=310, chain=chain, error="too many redirects")
+
+    # ---- response headers, cookies, tokens ------------------------------- #
+    def mine_headers(self, url, h, cookies):
+        if not self.in_scope(url):
+            return
+        host = urlparse(url).netloc
+        low = {k.lower(): v for k, v in h.items()}
+
+        def add(rule, title, sev, cat, value, note="", once=False):
+            if once:                       # server-wide facts: report once per host, not once per URL
+                with self.lock:
+                    if (host, rule, value) in self.hdr_hosts:
+                        return
+                    self.hdr_hosts.add((host, rule, value))
+            self.add_finding(Finding(rule, title, sev, cat, url, value[:200], f"{rule}: {value}"[:250], 0, note))
+
+        for raw in cookies:
+            name, _, rest = raw.partition("=")
+            value, _, attrs = rest.partition(";")
+            name, value, al = name.strip(), value.strip(), attrs.lower()
+            ss = re.search(r"samesite\s*=\s*(\w+)", al)
+            info = {"name": name, "value": value, "host": host, "url": url, "attrs": attrs.strip(),
+                    "httponly": "httponly" in al, "secure": "secure" in al, "samesite": ss.group(1) if ss else None}
+            with self.lock:
+                fresh = (host, name) not in self.cookies
+                self.cookies.setdefault((host, name), info)
+            if not fresh:
+                continue
+            if SESSION_NAME.search(name):
+                if not info["httponly"]:
+                    add("cookie-no-httponly", f"Session-like cookie '{name}' lacks HttpOnly", "medium", "cookie", name,
+                        "readable from JS, so any XSS can steal it")
+                if not info["secure"] and url.startswith("https://"):
+                    add("cookie-no-secure", f"Session-like cookie '{name}' lacks Secure", "medium", "cookie", name,
+                        "can be sent over plain HTTP")
+                if not info["samesite"]:
+                    add("cookie-no-samesite", f"Session-like cookie '{name}' has no SameSite", "low", "cookie", name,
+                        "relies on browser default for CSRF protection")
+            for f in self.analyzer.run(f"{url} (Set-Cookie {name})", value, "text"):
+                self.add_finding(f)
+
+        for k, v in low.items():
+            if k in TOKEN_HEADERS and v:
+                with self.lock:
+                    new = not any(t["header"] == k and t["value"] == v and t["host"] == host for t in self.tokens)
+                    if new:
+                        self.tokens.append({"header": k, "value": v, "host": host, "url": url})
+                if new:
+                    csrf = "csrf" in k or "xsrf" in k
+                    add("token-in-header", f"Token set in '{k}' response header", "info" if csrf else "medium", "token", v)
+                    for f in self.analyzer.run(f"{url} (header {k})", v, "text"):
+                        self.add_finding(f)
+            elif k in DISCLOSURE_HEADERS:
+                add("tech-disclosure", f"'{k}' discloses the stack", "low", "header", v, "fingerprinting aid", once=True)
+        if re.search(r"\d+\.\d+", low.get("server", "")):
+            add("server-version", "Server header discloses a version", "low", "header", low["server"], "check it against known CVEs", once=True)
+        if "x-debug-token" in low or "x-debug-token-link" in low:
+            add("debug-header", "Debug profiler header exposed", "medium", "header",
+                low.get("x-debug-token-link") or low["x-debug-token"], "profiler pages often leak config and requests", once=True)
+        acao, acac = low.get("access-control-allow-origin", ""), low.get("access-control-allow-credentials", "").lower()
+        if acao == "null":
+            add("cors-null-origin", "CORS allows the 'null' origin", "medium", "header", f"ACAO: {acao}", "sandboxed iframes can read responses")
+        elif acao == "*" and acac == "true":
+            add("cors-wildcard-credentials", "CORS wildcard with credentials header", "medium", "header",
+                "ACAO: * + ACAC: true", "invalid combo that signals a sloppy CORS config; test origin reflection manually")
+        for m in re.finditer(r"<([^>]+)>\s*;[^,]*rel=\"?(?:preload|prefetch|modulepreload|next|prev)", low.get("link", "")):
+            self.ref(url, m.group(1), f"Link header @ {url}", 1)
+        sm = low.get("sourcemap") or low.get("x-sourcemap")
+        if sm:
+            self.ref(url, sm, f"SourceMap header @ {url}", 1, kind="script")
+
+    def check_security_headers(self, resp):
+        host = urlparse(resp.url).netloc
+        low = {k.lower(): v for k, v in resp.headers.items()}
+        with self.lock:
+            if host in self.hdr_hosts:
+                return
+            self.hdr_hosts.add(host)
+        csp, miss = low.get("content-security-policy", ""), []
+        if resp.url.startswith("https://") and "strict-transport-security" not in low:
+            miss.append(("hsts", "Strict-Transport-Security"))
+        if not csp:
+            miss.append(("csp", "Content-Security-Policy"))
+        if "x-frame-options" not in low and "frame-ancestors" not in csp:
+            miss.append(("clickjacking", "X-Frame-Options / frame-ancestors"))
+        if low.get("x-content-type-options", "").lower() != "nosniff":
+            miss.append(("nosniff", "X-Content-Type-Options"))
+        for rid, name in miss:
+            self.add_finding(Finding(f"missing-{rid}", f"Missing {name}", "info", "header", resp.url, name, name, 0,
+                                     "checked once per host; usually low impact alone"))
 
     # ---- discovery ------------------------------------------------------- #
     def discover(self, url, src, depth, method="ANY", kind="page", templated=False):
@@ -823,7 +942,7 @@ class Argus:
             with self.lock:
                 self.endpoints.pop(key, None)
             return
-        ep.status, ep.content_type, ep.size = resp.status, resp.ctype, resp.size
+        ep.status, ep.content_type, ep.size, ep.headers = resp.status, resp.ctype, resp.size, resp.headers
         if anon is not None and not anon.error:
             state, reason = compare_auth(resp, anon, url)
         else:
@@ -842,6 +961,8 @@ class Argus:
         self.log_fetch(resp.status, state, url)
 
         if ck == "html":
+            if resp.status == 200:
+                self.check_security_headers(resp)
             self.mine_html(resp, depth)
         elif ck == "map":
             if not self.mine_map(resp.url, resp.text, depth) and kind == "guess":
@@ -928,9 +1049,11 @@ def build_report(ar: Argus, started: str):
         "finished": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "stats": {"requests": ar.requests, "endpoints": len(eps), "findings": len(fs),
                   "auth_required": sum(e.auth == "required" for e in eps),
+                  "cookies": len(ar.cookies), "token_headers": len(ar.tokens),
                   "authenticated_scan": ar.auth.present},
         "findings": [asdict(f) for f in fs],
         "endpoints": [{k: (sorted(v) if isinstance(v, set) else v) for k, v in asdict(e).items()} for e in eps],
+        "cookies": sorted(ar.cookies.values(), key=lambda c: (c["host"], c["name"])), "tokens": ar.tokens,
         "forms": ar.forms, "external_hosts": dict(ar.external), "errors": ar.errors,
     }
 
@@ -943,6 +1066,11 @@ def write_markdown(rep, path):
          "| Severity | Type | Value | Where | Note |", "|---|---|---|---|---|"]
     for f in rep["findings"]:
         L.append(f"| {f['severity']} | {cell(f['title'])} | `{cell(f['value'][:90])}` | {cell(f['url'])}:{f['line']} | {cell(f['note'])} |")
+    L += ["", "## Cookies and tokens set by the server", "",
+          "| Name | Host | HttpOnly | Secure | SameSite | Value |", "|---|---|---|---|---|---|"]
+    L += [f"| {cell(c['name'])} | {cell(c['host'])} | {c['httponly']} | {c['secure']} | {c['samesite'] or '-'} | `{cell(c['value'][:60])}` |"
+          for c in rep["cookies"]]
+    L += [f"- header `{t['header']}` at {t['url']}: `{cell(t['value'][:80])}`" for t in rep["tokens"]]
     L += ["", "## Endpoints needing authentication", ""]
     L += [f"- `{e['url']}`: {e['auth']} - {e['auth_reason']}" for e in rep["endpoints"] if e["auth"] in ("required", "likely", "rejected")] or ["_none detected_"]
     L += ["", "## All endpoints", "", "| Status | Auth | Methods | URL | Found in |", "|---|---|---|---|---|"]
@@ -964,6 +1092,14 @@ def print_summary(rep, ar: Argus):
         if e["status"]:
             by_auth[e["auth"]] += 1
     print("   auth: " + ", ".join(f"{k}={v}" for k, v in sorted(by_auth.items())))
+    if rep["cookies"] or rep["tokens"]:
+        print(f"   server-issued: {len(rep['cookies'])} cookie(s), {len(rep['tokens'])} token header(s)")
+        for c in rep["cookies"][:8]:
+            fl = [("HttpOnly" if c["httponly"] else "!HttpOnly"), ("Secure" if c["secure"] else "!Secure"),
+                  (f"SameSite={c['samesite']}" if c["samesite"] else "!SameSite")]
+            print(f"     {c['name']}={c['value'][:28]}  {C['dim']}{' '.join(fl)}{C['x']}")
+        for t in rep["tokens"][:5]:
+            print(f"     {t['header']}: {t['value'][:40]}")
     top = [f for f in fs if f["severity"] in ("critical", "high", "medium")]
     for f in top[:40]:
         print(f"  {C[f['severity']]} {f['severity']:<8} {C['x']} {f['title']}: {f['value'][:60]}  {C['dim']}{f['url'][:80]}:{f['line']}{C['x']}")
