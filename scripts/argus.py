@@ -15,6 +15,7 @@ import concurrent.futures as cf
 import json
 import math
 import os
+import random
 import re
 import sys
 import threading
@@ -22,6 +23,7 @@ import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from http.cookiejar import CookiePolicy
 from urllib.parse import parse_qsl, urldefrag, urljoin, urlparse
@@ -412,6 +414,8 @@ def classify_auth(r: Resp, url: str) -> tuple[str, str]:
     req_is_login = bool(LOGIN_RX.search(urlparse(url).path))
     if r.status == 401:
         return "required", "401 Unauthorized" + (f" ({r.headers['WWW-Authenticate'][:40]})" if "WWW-Authenticate" in r.headers else "")
+    if r.status == 429 or (r.status == 503 and "Retry-After" in r.headers):
+        return "unknown", "rate limited; auth state not determined (lower --rps and re-run)"
     if r.status == 407:
         return "required", "407 Proxy Authentication Required"
     if r.status == 403:
@@ -597,6 +601,63 @@ class PageParser(HTMLParser):
 
 
 # --------------------------------------------------------------------------- #
+# Rate control
+# --------------------------------------------------------------------------- #
+def parse_retry_after(v):
+    if not v:
+        return None
+    try:
+        return min(float(v), 120.0)
+    except ValueError:
+        try:
+            return max(0.0, min((parsedate_to_datetime(v) - datetime.now(timezone.utc)).total_seconds(), 120.0))
+        except Exception:
+            return None
+
+
+class Throttle:
+    """Global, adaptive request pacer shared by every thread.
+
+    - Spaces requests at `rps` (with a little jitter so traffic isn't metronomic).
+    - On 429 / 503+Retry-After: halves the rate and pauses ALL threads (honours Retry-After,
+      otherwise exponential backoff up to 60s).
+    - After a run of clean responses it speeds back up, never beyond the configured rps.
+    """
+    def __init__(self, rps: float, floor: float = 0.2):
+        self.max_rps = self.rps = max(rps, floor)
+        self.floor = floor
+        self.lock = threading.Lock()
+        self.next_at = self.pause_until = 0.0
+        self.consecutive = self.ok_streak = self.total_hits = 0
+
+    def wait(self):
+        with self.lock:
+            now = time.monotonic()
+            t = max(self.next_at, self.pause_until, now)
+            self.next_at = t + random.uniform(0.9, 1.3) / self.rps
+        if t > now:
+            time.sleep(t - now)
+
+    def penalize(self, retry_after=None) -> float:
+        with self.lock:
+            self.total_hits += 1
+            self.consecutive += 1
+            self.ok_streak = 0
+            self.rps = max(self.floor, self.rps / 2)
+            pause = retry_after if retry_after is not None else min(60.0, 2.0 ** self.consecutive)
+            self.pause_until = max(self.pause_until, time.monotonic() + pause)
+            return pause
+
+    def success(self):
+        with self.lock:
+            self.consecutive = 0
+            self.ok_streak += 1
+            if self.ok_streak >= 25 and self.rps < self.max_rps:
+                self.rps = min(self.max_rps, self.rps * 1.25)
+                self.ok_streak = 0
+
+
+# --------------------------------------------------------------------------- #
 # The crawler
 # --------------------------------------------------------------------------- #
 class Argus:
@@ -628,6 +689,9 @@ class Argus:
         self.queue: list[tuple] = []
         self.js_count = self.rejected = self.prompts = self.requests = 0
         self.declined = False
+        rps = a.rps if a.delay <= 0 else min(a.rps, 1.0 / a.delay)
+        self.throttle = Throttle(rps)
+        self.blocked = False
         self.analyzer = Analyzer(a.all_comments)
         if a.insecure:
             urllib3.disable_warnings()
@@ -665,12 +729,27 @@ class Argus:
             if use_auth and self.in_scope(cur):          # never send creds off-scope
                 headers.update(self.auth.as_headers())
             try:
-                if self.a.delay:
-                    time.sleep(self.a.delay)
-                with self.lock:
-                    self.requests += 1
-                r = s.get(cur, headers=headers, timeout=self.a.timeout, verify=not self.a.insecure,
-                          allow_redirects=False, stream=True)
+                for attempt in range(self.a.retries + 1):
+                    if self.blocked:
+                        return Resp(cur, error="stopped: target keeps rate-limiting us", chain=chain)
+                    self.throttle.wait()
+                    with self.lock:
+                        self.requests += 1
+                    r = s.get(cur, headers=headers, timeout=self.a.timeout, verify=not self.a.insecure,
+                              allow_redirects=False, stream=True)
+                    if r.status_code == 429 or (r.status_code == 503 and "Retry-After" in r.headers):
+                        pause = self.throttle.penalize(parse_retry_after(r.headers.get("Retry-After")))
+                        self.say(f"{C['medium']}[rate]{C['x']} {r.status_code} from {urlparse(cur).netloc} - "
+                                 f"pausing {pause:.0f}s, now {self.throttle.rps:.1f} req/s "
+                                 f"(retry {attempt + 1}/{self.a.retries})")
+                        if self.throttle.consecutive >= 8:
+                            self.blocked = True
+                        if attempt < self.a.retries and not self.blocked:
+                            r.close()
+                            continue
+                    else:
+                        self.throttle.success()
+                    break
             except requests.RequestException as e:
                 return Resp(cur, error=type(e).__name__ + ": " + str(e)[:120], chain=chain)
             hdrs = dict(r.headers)
@@ -972,6 +1051,8 @@ class Argus:
             self.mine_text(resp.url, resp.text, ck, depth)
 
     def safe_process(self, item):
+        if self.blocked:
+            return
         try:
             self.process(item)
         except Exception as e:      # one bad page must not kill the crawl
@@ -980,7 +1061,7 @@ class Argus:
 
     # ---- the smart auth bit ---------------------------------------------- #
     def maybe_prompt(self) -> bool:
-        if self.a.no_prompt or self.declined or self.prompts >= 3 or not sys.stdin.isatty():
+        if self.blocked or self.a.no_prompt or self.declined or self.prompts >= 3 or not sys.stdin.isatty():
             return False
         with self.lock:
             gated = [k for k in self.gated if k in self.endpoints]
@@ -1050,6 +1131,7 @@ def build_report(ar: Argus, started: str):
         "stats": {"requests": ar.requests, "endpoints": len(eps), "findings": len(fs),
                   "auth_required": sum(e.auth == "required" for e in eps),
                   "cookies": len(ar.cookies), "token_headers": len(ar.tokens),
+                  "rate_limit_hits": ar.throttle.total_hits, "stopped_early": ar.blocked,
                   "authenticated_scan": ar.auth.present},
         "findings": [asdict(f) for f in fs],
         "endpoints": [{k: (sorted(v) if isinstance(v, set) else v) for k, v in asdict(e).items()} for e in eps],
@@ -1105,6 +1187,10 @@ def print_summary(rep, ar: Argus):
         print(f"  {C[f['severity']]} {f['severity']:<8} {C['x']} {f['title']}: {f['value'][:60]}  {C['dim']}{f['url'][:80]}:{f['line']}{C['x']}")
     if len(top) > 40:
         print(f"  ... {len(top) - 40} more in the report")
+    if ar.throttle.total_hits:
+        print(f"\n{C['medium']}[!]{C['x']} Rate-limited {ar.throttle.total_hits} time(s); Argus slowed itself down automatically. "
+              "Use a lower --rps next time." + (" The target kept blocking, so the crawl STOPPED EARLY; "
+              "results are partial. Wait a while (or check for an IP ban) and re-run." if ar.blocked else ""))
     if ar.gated and not ar.auth.present:
         print(f"\n{C['medium']}[!]{C['x']} {len(ar.gated)} endpoint(s) need authentication and were not tested with a session. "
               "Re-run with --cookie / --token / -H.")
@@ -1120,7 +1206,9 @@ def main():
     ap.add_argument("--max-pages", type=int, default=500)
     ap.add_argument("--max-js", type=int, default=300, help="cap on script/source-map fetches")
     ap.add_argument("--threads", type=int, default=8)
-    ap.add_argument("--delay", type=float, default=0.0, help="seconds between requests per thread")
+    ap.add_argument("--rps", type=float, default=5.0, help="max requests/second across all threads (default 5)")
+    ap.add_argument("--delay", type=float, default=0.0, help="minimum seconds between requests (caps --rps)")
+    ap.add_argument("--retries", type=int, default=4, help="retries per request on 429/503+Retry-After (default 4)")
     ap.add_argument("--timeout", type=float, default=15)
     ap.add_argument("--subdomains", action="store_true", help="treat subdomains of the target as in scope")
     ap.add_argument("--scope", action="append", help="extra in-scope hostname (repeatable)")
@@ -1144,7 +1232,7 @@ def main():
     ar = Argus(a)
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
     print(f"{C['b']}Argus {VERSION}{C['x']}  target={a.url}  auth={'yes' if ar.auth.present else 'none'}  "
-          f"GET-only, scope={sorted(ar.hosts)}{' +subdomains' if a.subdomains else ''}")
+          f"rate<={ar.throttle.max_rps:g}/s  GET-only, scope={sorted(ar.hosts)}{' +subdomains' if a.subdomains else ''}")
     try:
         ar.crawl()
     except KeyboardInterrupt:
