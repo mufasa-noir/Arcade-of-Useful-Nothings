@@ -1,0 +1,83 @@
+# jobwatch config. Paths are relative to this file.
+output: jobs.md
+state_file: .jobwatch_state.json
+max_age_days: 14        # ignore postings older than this (when the board gives a date)
+workers: 6              # sources fetched in parallel
+
+search:
+  # A posting matches if ANY keyword hits. Title hits rank higher than description hits.
+  keywords:
+    - security engineer
+    - penetration tester
+    - application security
+    - firmware
+    - embedded
+    - hardware security
+  # Dropped if any of these appear in the TITLE
+  exclude:
+    - sales
+    - recruiter
+    - unpaid
+  # Optional: require one of these somewhere in the posting. Empty = no filter.
+  locations: []         # e.g. [remote, worldwide, anywhere]
+  # true = keywords must be in the title (much less noise from long descriptions)
+  title_only: false
+
+notify:
+  ntfy_topic: ""        # optional phone push via https://ntfy.sh - pick a hard-to-guess topic name
+
+sources:
+  # ---- Job APIs / feeds (stable, intended for programmatic use) ----
+  - {name: RemoteOK, type: remoteok}
+  - {name: Remotive, type: remotive, min_interval_minutes: 360}   # Remotive asks for a few fetches a day
+  - {name: Arbeitnow, type: arbeitnow}
+  - name: WeWorkRemotely Programming
+    type: rss
+    url: https://weworkremotely.com/categories/remote-programming-jobs.rss
+    title_format: "company: title"
+  - name: WeWorkRemotely DevOps
+    type: rss
+    url: https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss
+    title_format: "company: title"
+
+  # ---- Forums / communities ----
+  - {name: HN Who's Hiring, type: hn_hiring, min_interval_minutes: 60}
+  - {name: HN Jobs, type: hn_jobs}
+  - {name: Reddit r/forhire, type: reddit, subreddit: forhire}
+  # Add any subreddit the same way:
+  # - {name: Reddit r/netsec, type: reddit, subreddit: netsec}
+
+  # ---- Telegram public channels (web preview must be enabled: t.me/s/<channel> opens in a browser) ----
+  - {name: Telegram example, type: telegram, channel: replace_with_channel_name, enabled: false}
+
+  # ---- Company career boards via ATS APIs: the earliest place roles appear ----
+  # Replace with the companies you want. The token is the slug in the careers URL:
+  #   boards.greenhouse.io/<token>   jobs.lever.co/<token>   jobs.ashbyhq.com/<token>
+  - {name: Greenhouse companies, type: greenhouse, companies: [cloudflare, gitlab]}
+  - {name: Lever companies, type: lever, companies: [palantir]}
+  - {name: Ashby companies, type: ashby, companies: [openai]}
+
+  # ---- Regional boards: generic link scraper ----
+  # No API, so these scrape HTML and respect robots.txt. URL patterns are best guesses:
+  # run `python jobwatch.py --check --only "BrighterMonday"` and adjust link_pattern if you get 0 items.
+  - name: BrighterMonday
+    type: html_links
+    url: https://example.com/jobs
+    link_pattern: "/listings/"
+    enabled: true
+  - name: MyJobMag
+    type: html_links
+    url: https://example.com/jobs
+    link_pattern: "/job/"
+    enabled: true
+
+  # ---- CSS-selector scraper for any other board ----
+  # - name: Some Board
+  #   type: html
+  #   url: https://example.com/jobs
+  #   item: "div.job-card"      # one element per posting
+  #   title: "h2"               # relative to item
+  #   link: "a"                 # relative to item (use "self" if the item itself is the <a>)
+  #   company: ".company"       # optional
+  #   location: ".location"     # optional
+  #   enabled: false
